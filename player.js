@@ -26,7 +26,12 @@ imports.gi.versions.GstVideo = '1.0';
 const {Gdk, GdkX11, Gst, GstVideo, Gtk} = imports.gi;
 void GdkX11; void GstVideo; // loaded for get_xid() and set_window_handle()
 
-const SINKS = ['glimagesink', 'xvimagesink', 'ximagesink'];
+// ximagesink first: it never waits on the compositor. A GL sink on a monitor
+// covered by a fullscreen window blocks, which stalled the other monitor down
+// to about a frame a second. With CPU scaling at 720p it is also far cheaper
+// where OpenGL runs in software (24% CPU against 135%).
+// COWS_SINK=glimagesink overrides.
+const SINKS = ['ximagesink', 'glimagesink', 'xvimagesink'];
 
 function die(msg) {
     printerr(`player: ${msg}`);
@@ -74,39 +79,55 @@ if (!video || !imports.gi.Gio.File.new_for_path(video).query_exists(null))
 Gtk.init(null);
 Gst.init(null);
 
-const sinkName = SINKS.find(n => Gst.ElementFactory.find(n));
+const wanted = imports.gi.GLib.getenv('COWS_SINK');
+const sinkName = [wanted, ...SINKS].find(n => n && Gst.ElementFactory.find(n));
 if (!sinkName)
     die('no usable GStreamer video sink (glimagesink, xvimagesink or ximagesink)');
 const canCrop = Gst.ElementFactory.find('aspectratiocrop') !== null;
+const VIDEO_ASPECT = 16 / 9;
 
 // playbin finds and links the decoder itself (gjs can't run callbacks on
 // GStreamer's streaming threads, which manual decodebin linking needs).
-// Its video output goes into our bin: convert -> tee -> one branch per monitor.
+// Its video output goes into our bin: a tee with one branch per monitor.
 const pipeline = make('playbin');
 pipeline.uri = imports.gi.Gio.File.new_for_path(video).get_uri();
+// Video only: playbin's default soft colour-balance and deinterlace filters
+// touch every frame and roughly quadrupled the CPU cost.
+Gst.util_set_object_arg(pipeline, 'flags', 'video');
 const output = new Gst.Bin({name: 'output'});
-const convert = make('videoconvert');
-const toRaw = rawCaps();
 const tee = make('tee');
-for (const e of [convert, toRaw, tee])
-    output.add(e);
-convert.link(toRaw);
-toRaw.link(tee);
-output.add_pad(Gst.GhostPad.new('sink', convert.get_static_pad('sink')));
+output.add(tee);
+output.add_pad(Gst.GhostPad.new('sink', tee.get_static_pad('sink')));
 
 const windows = [];
 const display = Gdk.Display.get_default();
 for (let i = 0; i < display.get_n_monitors(); i++) {
     const geo = display.get_monitor(i).get_geometry();
     const window = makeWindow(geo);
+    // Not leaky: a leaky queue never pushes back, so the decoder ran flat out
+    // (100% CPU) only for the extra frames to be thrown away. ximagesink never
+    // blocks, so one monitor can't stall the others.
     const chain = [make('queue')];
-    if (canCrop) {
-        const crop = make('aspectratiocrop');
-        Gst.util_set_object_arg(crop, 'aspect-ratio', `${geo.width}/${geo.height}`);
-        chain.push(rawCaps(), crop, rawCaps(), make('videoconvert'));
+    // Crop only when the monitor's shape differs from the video's (16:9);
+    // cropping copies every frame, which slow lab PCs can't afford.
+    const crop = canCrop && Math.abs(geo.width / geo.height - VIDEO_ASPECT) > 0.02;
+    if (crop) {
+        const cropper = make('aspectratiocrop');
+        Gst.util_set_object_arg(cropper, 'aspect-ratio', `${geo.width}/${geo.height}`);
+        chain.push(make('videoconvert'), rawCaps(), cropper, rawCaps());
     }
+    // ximagesink can't scale, so scale to the monitor's real pixel size here.
+    const scale = window.get_scale_factor();
+    const size = make('capsfilter');
+    size.caps = Gst.Caps.from_string(
+        `video/x-raw,width=${geo.width * scale},height=${geo.height * scale},pixel-aspect-ratio=1/1`);
+    // Convert to X11's RGB format at 720p, then scale: no converter after the
+    // scaler, so videoscale (which can't change format) forces that order.
+    // Converting at full screen size instead doubled the CPU cost.
+    chain.push(make('videoconvert'), make('videoscale'), size);
     const sink = make(sinkName);
-    sink.force_aspect_ratio = !canCrop;
+    if ('force_aspect_ratio' in sink)
+        sink.force_aspect_ratio = false;
     sink.sync = true;
     chain.push(sink);
     for (const e of chain)
@@ -139,6 +160,11 @@ bus.connect('message', (_bus, msg) => {
     case Gst.MessageType.EOS:
         pipeline.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH, 0);
         break;
+    case Gst.MessageType.QOS: {
+        const [, processed, dropped] = msg.parse_qos_stats();
+        qos.set(msg.src.get_name(), [processed, dropped]);
+        break;
+    }
     case Gst.MessageType.ERROR: {
         const [err, dbg] = msg.parse_error();
         printerr(`player: ${err.message}\n${dbg}`);
@@ -147,6 +173,17 @@ bus.connect('message', (_bus, msg) => {
     }
     }
 });
+
+// COWS_DEBUG=1: print frames processed/dropped every 5 s (from the QoS
+// reports sinks send whenever they have to drop a late frame).
+const qos = new Map();
+if (imports.gi.GLib.getenv('COWS_DEBUG')) {
+    imports.gi.GLib.timeout_add_seconds(0, 5, () => {
+        print(`${sinkName}: ` + (qos.size ? [...qos.entries()].map(([n, [p, d]]) =>
+            `${n} processed ${p} dropped ${d}`).join(' | ') : 'no frames dropped'));
+        return true;
+    });
+}
 
 pipeline.set_state(Gst.State.PAUSED);
 Gtk.main();

@@ -68,24 +68,59 @@ get_tools() {
   fi
 }
 
+# YouTube sometimes cuts a download off (HTTP 403) unless yt-dlp can solve its
+# JavaScript challenge, which needs deno. Resume first; fetch deno if needed.
+download_source() {
+  local try
+  for try in 1 2 3; do
+    "$YTDLP" --no-playlist --retries 10 --fragment-retries 10 -f "$FORMAT" \
+      -o "$CACHE/src.%(ext)s" "$URL" >&2 && return 0
+    say "download interrupted, retrying ($try/3)"
+  done
+  return 1
+}
+
+get_deno() {
+  command -v deno >/dev/null && return 0
+  if [[ ! -x $TOOLS/deno ]]; then
+    say "fetching deno so yt-dlp can answer YouTube's check (into $TOOLS)"
+    curl -fL --progress-bar -o "$TOOLS/deno.zip" \
+      https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip || return 1
+    if command -v unzip >/dev/null; then
+      unzip -oq "$TOOLS/deno.zip" -d "$TOOLS"
+    else
+      python3 -m zipfile -e "$TOOLS/deno.zip" "$TOOLS"
+    fi
+    chmod +x "$TOOLS/deno"
+    rm -f "$TOOLS/deno.zip"
+  fi
+  export PATH="$TOOLS:$PATH"
+}
+
 # ---------------------------------------------------------------- video
 
 seek_to() { (($1 > 0)) && awk -v f="$1" -v r="$FPS" 'BEGIN { printf "-ss %.6f", (f - 0.5) / r }'; return 0; }
 count_frames() { "$FFPROBE" -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$1"; }
 
-# VP9 in WebM: GNOME's own GStreamer plays it with no extra codecs.
-ENCODE=(-an -c:v libvpx-vp9 -crf 32 -b:v 0 -deadline realtime -cpu-used 8 -row-mt 1 -g 250 -pix_fmt yuv420p)
+# 720p VP8 in WebM: GNOME's own GStreamer plays it with no extra codecs, and
+# it decodes several times faster than 1080p VP9 (which made lab PCs drop to
+# about one frame a second). The original is 480p, so nothing is lost.
+SCALE="scale=1280:720:flags=lanczos"
+ENCODE=(-an -c:v libvpx -b:v 3M -crf 6 -qmin 2 -qmax 30 -deadline good -cpu-used 4
+  -auto-alt-ref 0 -g 250 -pix_fmt yuv420p)
+VERSION=v2  # bump when the encoding changes, so old renders are rebuilt
 
 build() {
-  local mode=$1 out="$CACHE/cows-$1.webm"
+  local mode=$1 out="$CACHE/cows-$1.$VERSION.webm"
   [[ -s $out ]] && return
+  rm -f "$CACHE/cows-$mode.webm" "$CACHE"/cows-"$mode".v*.webm
   get_tools
   mkdir -p "$CACHE"
   local src
   src=$(compgen -G "$CACHE/src.*" | grep -v '\.part$' | head -n1 || true)
   if [[ -z $src ]]; then
     say "downloading cows & cows & cows"
-    "$YTDLP" --no-playlist -f "$FORMAT" -o "$CACHE/src.%(ext)s" "$URL" >&2
+    download_source || { get_deno && download_source; } || die "YouTube refused the download; try again in a minute"
     src=$(compgen -G "$CACHE/src.*" | grep -v '\.part$' | head -n1)
   fi
 
@@ -100,7 +135,7 @@ build() {
     say "preparing the perfect loop"
     # shellcheck disable=SC2046
     "$FFMPEG" -v error -stats -y $(seek_to "$first") -i "$src" -frames:v $((end - first)) \
-      -vf "setpts=N/($FPS*TB)" -r $FPS "${ENCODE[@]}" "$tmp/out.webm"
+      -vf "$SCALE,setpts=N/($FPS*TB)" -r $FPS "${ENCODE[@]}" "$tmp/out.webm"
   else
     say "preparing the ping-pong loop: forward"
     # shellcheck disable=SC2046
@@ -125,7 +160,7 @@ build() {
     for f in "$tmp"/*.mkv; do printf "file '%s'\n" "$f"; done >"$tmp/list.txt"
     say "encoding"
     "$FFMPEG" -v error -stats -y -f concat -safe 0 -i "$tmp/list.txt" \
-      -vf "setpts=N/($FPS*TB)" -r $FPS "${ENCODE[@]}" "$tmp/out.webm"
+      -vf "$SCALE,setpts=N/($FPS*TB)" -r $FPS "${ENCODE[@]}" "$tmp/out.webm"
     local got
     got=$(count_frames "$tmp/out.webm")
     ((got == 2 * frames - 2)) || die "ping-pong came out with $got frames instead of $((2 * frames - 2))"
@@ -249,7 +284,7 @@ cmd_on() {
   # setsid: keeps playing after the terminal is closed, until you log out.
   # X11 (XWayland on Wayland): window types and video embedding need it.
   env -u WAYLAND_DISPLAY GDK_BACKEND=x11 GST_GL_WINDOW=x11 \
-    setsid gjs "$HERE/player.js" "$CACHE/cows-$mode.webm" >"$LOG" 2>&1 </dev/null &
+    setsid gjs "$HERE/player.js" "$CACHE/cows-$mode.$VERSION.webm" >"$LOG" 2>&1 </dev/null &
   echo $! >"$PIDFILE"
   echo "$mode" >"$CACHE/mode"
   sleep 2
