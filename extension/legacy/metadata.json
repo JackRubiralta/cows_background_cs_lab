@@ -1,0 +1,7 @@
+{
+  "uuid": "cows-background@jackrubiralta.github.io",
+  "name": "cows-background",
+  "description": "Shows the cows-background video player as the real desktop background. Installed and removed by cows.sh.",
+  "shell-version": ["40", "41", "42", "43", "44"],
+  "url": "https://github.com/JackRubiralta/cows_background_cs_lab"
+}
