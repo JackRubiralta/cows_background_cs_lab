@@ -153,39 +153,46 @@ ext_install() {
   cp "$HERE/extension/$( ((major >= 45)) && echo esm || echo legacy)"/{extension.js,metadata.json} "$EXT_DIR/"
 }
 
-# enable|disable through the user's own GNOME settings. Prints "ok" or
-# "blocked" (an administrator locked extensions) for enable. If user
-# extensions were switched off, enable switches them on and remembers that
-# so disable can switch them off again.
+# enable|disable through the user's own GNOME settings. enable prints "ok",
+# or "blocked" if an administrator locked extensions. If user extensions were
+# switched off, enable switches them on and remembers that so disable can
+# switch them off again.
+gs() { gsettings "$1" org.gnome.shell "${@:2}"; }
+strv_remove() {
+  local cur new
+  cur=$(gs get "$1")
+  [[ $cur == *"'$EXT_UUID'"* ]] || return 0
+  new=$(sed "s/, '$EXT_UUID'//; s/'$EXT_UUID', //; s/'$EXT_UUID'//" <<<"$cur")
+  [[ $new == "[]" ]] && new="@as []"
+  [[ $(gs writable "$1") == true ]] && gs set "$1" "$new"
+  return 0
+}
 ext_settings() {
   mkdir -p "$CACHE"
-  python3 - "$1" "$EXT_UUID" "$EXT_FLIPPED" <<'PY'
-import os, sys
-from gi.repository import Gio
-action, uuid, flipped = sys.argv[1:4]
-s = Gio.Settings.new("org.gnome.shell")
-def without(key):
-    v = s.get_strv(key)
-    if uuid in v and s.is_writable(key):
-        s.set_strv(key, [x for x in v if x != uuid])
-if action == "enable":
-    if s.get_boolean("disable-user-extensions") and s.is_writable("disable-user-extensions"):
-        s.set_boolean("disable-user-extensions", False)
-        open(flipped, "w").close()
-    without("disabled-extensions")
-    v = s.get_strv("enabled-extensions")
-    if uuid not in v and s.is_writable("enabled-extensions"):
-        s.set_strv("enabled-extensions", v + [uuid])
-    Gio.Settings.sync()
-    ok = uuid in s.get_strv("enabled-extensions") and not s.get_boolean("disable-user-extensions")
-    print("ok" if ok else "blocked")
-else:
-    without("enabled-extensions")
-    if os.path.exists(flipped):
-        s.set_boolean("disable-user-extensions", True)
-        os.remove(flipped)
-    Gio.Settings.sync()
-PY
+  if [[ $1 == enable ]]; then
+    if [[ $(gs get disable-user-extensions) == true && $(gs writable disable-user-extensions) == true ]]; then
+      gs set disable-user-extensions false
+      : >"$EXT_FLIPPED"
+    fi
+    strv_remove disabled-extensions
+    local cur
+    cur=$(gs get enabled-extensions)
+    if [[ $cur != *"'$EXT_UUID'"* && $(gs writable enabled-extensions) == true ]]; then
+      if [[ $cur == "@as []" || $cur == "[]" ]]; then gs set enabled-extensions "['$EXT_UUID']"
+      else gs set enabled-extensions "${cur%]}, '$EXT_UUID']"; fi
+    fi
+    if [[ $(gs get enabled-extensions) == *"'$EXT_UUID'"* && $(gs get disable-user-extensions) == false ]]; then
+      echo ok
+    else
+      echo blocked
+    fi
+  else
+    strv_remove enabled-extensions
+    if [[ -f $EXT_FLIPPED ]]; then
+      gs set disable-user-extensions true
+      rm -f "$EXT_FLIPPED"
+    fi
+  fi
 }
 
 # ---------------------------------------------------------------- player
@@ -193,7 +200,7 @@ PY
 running_pid() {
   local pid
   pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
-  [[ -n $pid ]] && grep -q 'player.py' "/proc/$pid/cmdline" 2>/dev/null && echo "$pid"
+  [[ -n $pid ]] && grep -q 'player.js' "/proc/$pid/cmdline" 2>/dev/null && echo "$pid"
 }
 
 stop_player() {
@@ -208,20 +215,19 @@ stop_player() {
 
 check_runtime() {
   [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] || die "run this from a terminal inside your desktop session"
-  python3 - <<'EOF' || die "this machine's Python can't do GTK 3 + GStreamer (see the message above)"
-import gi
-gi.require_version("Gtk", "3.0"); gi.require_version("GdkX11", "3.0")
-gi.require_version("Gst", "1.0"); gi.require_version("GstVideo", "1.0")
-from gi.repository import Gst
-Gst.init(None)
-missing = [] if Gst.ElementFactory.find("matroskademux") else ["matroskademux"]
-if not any(Gst.ElementFactory.find(d) for d in ("vp9dec", "avdec_vp9", "vavp9dec", "vaapivp9dec")):
-    missing.append("a VP9 decoder")
-if not any(Gst.ElementFactory.find(s) for s in ("glimagesink", "xvimagesink", "ximagesink")):
-    missing.append("a video sink")
-if missing:
-    raise SystemExit("missing GStreamer pieces: " + ", ".join(missing))
-EOF
+  command -v gjs >/dev/null || die "needs gjs, which every GNOME desktop has; is this GNOME?"
+  gjs -c "
+imports.gi.versions.Gtk = '3.0'; imports.gi.versions.Gdk = '3.0'; imports.gi.versions.GdkX11 = '3.0';
+imports.gi.versions.Gst = '1.0'; imports.gi.versions.GstVideo = '1.0';
+const {Gst, Gtk, GdkX11, GstVideo} = imports.gi;
+Gst.init(null);
+const has = n => Gst.ElementFactory.find(n) !== null;
+const missing = [];
+if (!has('matroskademux')) missing.push('matroskademux');
+if (!['vp9dec', 'avdec_vp9', 'vavp9dec', 'vaapivp9dec'].some(has)) missing.push('a VP9 decoder');
+if (!['glimagesink', 'xvimagesink', 'ximagesink'].some(has)) missing.push('a video sink');
+if (missing.length) { printerr('missing GStreamer pieces: ' + missing.join(', ')); imports.system.exit(1); }
+" || die "this machine's GTK 3 / GStreamer can't play the video (see the message above)"
 }
 
 cmd_on() {
@@ -241,7 +247,9 @@ cmd_on() {
   [[ $method == extension && $ext == unsupported ]] && die "the extension method needs GNOME 40 or newer"
 
   # setsid: keeps playing after the terminal is closed, until you log out.
-  setsid python3 "$HERE/player.py" "$CACHE/cows-$mode.webm" >"$LOG" 2>&1 </dev/null &
+  # X11 (XWayland on Wayland): window types and video embedding need it.
+  env -u WAYLAND_DISPLAY GDK_BACKEND=x11 GST_GL_WINDOW=x11 \
+    setsid gjs "$HERE/player.js" "$CACHE/cows-$mode.webm" >"$LOG" 2>&1 </dev/null &
   echo $! >"$PIDFILE"
   echo "$mode" >"$CACHE/mode"
   sleep 2

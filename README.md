@@ -28,9 +28,10 @@ prepares the loop. After that `./cows.sh` starts instantly.
 Force one with `--method extension` or `--method window`. `./cows.sh status`
 says which one is in use.
 
-It works in both GNOME on Wayland (the default) and GNOME on Xorg. The video
-is decoded by the GStreamer that GNOME already uses, so no codecs need
-installing.
+It works in both GNOME on Wayland (the default) and GNOME on Xorg. Nothing
+needs installing: the player runs on `gjs`, the JavaScript runtime GNOME
+Shell itself is built on, and decodes the video with the GStreamer GNOME
+already uses.
 
 ## Turning it off
 

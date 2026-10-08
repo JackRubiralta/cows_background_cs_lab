@@ -1,6 +1,6 @@
 // cows-background, GNOME 40 to 44 (same as ../esm/extension.js, old module style).
 //
-// player.py opens one window per monitor titled "cows-background". This
+// player.js opens one window per monitor titled "cows-background". This
 // extension paints a live clone of each one into GNOME's background layer,
 // just above the wallpaper, and makes the window itself invisible. The video
 // then really is the desktop background. Disabling restores the windows.
